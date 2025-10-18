@@ -14,6 +14,7 @@
 (define-data-var policy-counter uint u0)
 (define-data-var total-premiums uint u0)
 (define-data-var total-payouts uint u0)
+(define-data-var base-premium-rate uint u100)
 
 (define-map policies uint {
     farmer: principal,
@@ -42,10 +43,72 @@
 (define-map farmer-policies principal (list 50 uint))
 (define-map policy-claims uint { claimed-at: uint, payout-amount: uint })
 
+(define-map location-risk-profiles (string-ascii 100) {
+    total-policies: uint,
+    total-claims: uint,
+    avg-temperature: int,
+    avg-rainfall: uint,
+    risk-multiplier: uint
+})
+
 (define-public (set-oracle (new-oracle principal))
     (begin
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
         (ok (var-set oracle-address (some new-oracle)))
+    )
+)
+
+(define-public (calculate-dynamic-premium 
+    (location (string-ascii 100))
+    (coverage uint)
+    (duration-blocks uint))
+    (let ((location-profile (default-to 
+            { total-policies: u0, total-claims: u0, avg-temperature: 20, avg-rainfall: u500, risk-multiplier: u100 }
+            (map-get? location-risk-profiles location)))
+          (base-rate (var-get base-premium-rate))
+          (coverage-factor (/ coverage u1000))
+          (duration-factor (/ duration-blocks u144))
+          (risk-factor (get risk-multiplier location-profile)))
+        
+        (let ((calculated-premium (* (* (* base-rate coverage-factor) duration-factor) risk-factor)))
+            (ok (/ calculated-premium u10000))
+        )
+    )
+)
+
+(define-public (update-location-risk-profile
+    (location (string-ascii 100))
+    (temperature int)
+    (rainfall uint))
+    (let ((current-profile (default-to 
+            { total-policies: u0, total-claims: u0, avg-temperature: 20, avg-rainfall: u500, risk-multiplier: u100 }
+            (map-get? location-risk-profiles location))))
+        
+        (let ((total-policies-int (to-int (get total-policies current-profile)))
+              (new-avg-temp (/ (+ (* (get avg-temperature current-profile) total-policies-int) temperature) 
+                               (+ total-policies-int 1)))
+              (new-avg-rain (/ (+ (* (to-int (get avg-rainfall current-profile)) (to-int (get total-policies current-profile))) (to-int rainfall)) 
+                               (to-int (+ (get total-policies current-profile) u1))))
+              (new-total-policies (+ (get total-policies current-profile) u1))
+              (new-risk-multiplier (calculate-risk-multiplier new-avg-temp (to-uint new-avg-rain))))
+            
+            (map-set location-risk-profiles location {
+                total-policies: new-total-policies,
+                total-claims: (get total-claims current-profile),
+                avg-temperature: new-avg-temp,
+                avg-rainfall: (to-uint new-avg-rain),
+                risk-multiplier: new-risk-multiplier
+            })
+            
+            (ok true)
+        )
+    )
+)
+
+(define-private (calculate-risk-multiplier (avg-temp int) (avg-rainfall uint))
+    (let ((temp-risk (if (or (< avg-temp 0) (> avg-temp 35)) u150 u100))
+          (rain-risk (if (or (< avg-rainfall u200) (> avg-rainfall u800)) u120 u100)))
+        (/ (* temp-risk rain-risk) u100)
     )
 )
 
@@ -88,7 +151,8 @@
         (var-set policy-counter policy-id)
         (var-set total-premiums (+ (var-get total-premiums) premium))
         
-        (let ((current-policies (default-to (list) (map-get? farmer-policies tx-sender))))
+        (let ((ignore-result (update-location-risk-profile location 20 u500))
+              (current-policies (default-to (list) (map-get? farmer-policies tx-sender))))
             (map-set farmer-policies tx-sender (unwrap! (as-max-len? (append current-policies policy-id) u50) ERR_INVALID_POLICY))
         )
         
@@ -151,6 +215,13 @@
                             })
                             
                             (var-set total-payouts (+ (var-get total-payouts) (get coverage policy-data)))
+                            
+                            (let ((current-profile (default-to 
+                                    { total-policies: u0, total-claims: u0, avg-temperature: 20, avg-rainfall: u500, risk-multiplier: u100 }
+                                    (map-get? location-risk-profiles location))))
+                                (map-set location-risk-profiles location
+                                    (merge current-profile { total-claims: (+ (get total-claims current-profile) u1) }))
+                            )
                             
                             (ok (get coverage policy-data))
                         )
@@ -233,6 +304,17 @@
         contract-balance: (stx-get-balance (as-contract tx-sender)),
         oracle: (var-get oracle-address)
     }
+)
+
+(define-read-only (get-location-risk-profile (location (string-ascii 100)))
+    (map-get? location-risk-profiles location)
+)
+
+(define-read-only (get-premium-quote 
+    (location (string-ascii 100))
+    (coverage uint)
+    (duration-blocks uint))
+    (calculate-dynamic-premium location coverage duration-blocks)
 )
 
 (define-read-only (is-policy-eligible-for-payout (policy-id uint))
