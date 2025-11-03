@@ -374,3 +374,15 @@
         count
     )
 )
+
+(define-public (set-base-premium-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+        (asserts! (> new-rate u0) ERR_INVALID_POLICY)
+        (ok (var-set base-premium-rate new-rate))
+    )
+)
+
+(define-read-only (get-base-premium-rate)
+    (var-get base-premium-rate)
+)
