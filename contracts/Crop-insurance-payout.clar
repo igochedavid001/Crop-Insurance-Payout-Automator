@@ -8,6 +8,11 @@
 (define-constant ERR_NOT_ORACLE (err u106))
 (define-constant ERR_INVALID_WEATHER_DATA (err u107))
 (define-constant ERR_POLICY_NOT_FOUND (err u108))
+(define-constant ERR_POLICY_NOT_EXPIRED (err u109))
+(define-constant ERR_INVALID_RENEWAL (err u110))
+
+(define-constant LOYALTY_DISCOUNT_THRESHOLD u3)
+(define-constant LOYALTY_DISCOUNT_PERCENT u10)
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var oracle-address (optional principal) none)
@@ -42,6 +47,7 @@
 
 (define-map farmer-policies principal (list 50 uint))
 (define-map policy-claims uint { claimed-at: uint, payout-amount: uint })
+(define-map farmer-renewal-count principal uint)
 
 (define-map location-risk-profiles (string-ascii 100) {
     total-policies: uint,
@@ -385,4 +391,85 @@
 
 (define-read-only (get-base-premium-rate)
     (var-get base-premium-rate)
+)
+
+(define-public (renew-policy 
+    (old-policy-id uint)
+    (new-premium uint)
+    (new-coverage uint)
+    (duration-blocks uint))
+    (let ((old-policy (unwrap! (map-get? policies old-policy-id) ERR_POLICY_NOT_FOUND))
+          (farmer tx-sender)
+          (renewal-count (default-to u0 (map-get? farmer-renewal-count farmer))))
+        
+        (asserts! (is-eq farmer (get farmer old-policy)) ERR_NOT_AUTHORIZED)
+        (asserts! (> stacks-block-height (get end-block old-policy)) ERR_POLICY_NOT_EXPIRED)
+        (asserts! (not (get is-claimed old-policy)) ERR_INVALID_RENEWAL)
+        (asserts! (> new-premium u0) ERR_INVALID_POLICY)
+        (asserts! (> new-coverage u0) ERR_INVALID_POLICY)
+        (asserts! (> duration-blocks u0) ERR_INVALID_POLICY)
+        
+        (let ((discount (if (>= renewal-count LOYALTY_DISCOUNT_THRESHOLD)
+                            (/ (* new-premium LOYALTY_DISCOUNT_PERCENT) u100)
+                            u0))
+              (final-premium (- new-premium discount))
+              (policy-id (+ (var-get policy-counter) u1))
+              (current-block stacks-block-height)
+              (end-block (+ stacks-block-height duration-blocks)))
+            
+            (asserts! (>= (stx-get-balance farmer) final-premium) ERR_INSUFFICIENT_FUNDS)
+            (try! (stx-transfer? final-premium farmer (as-contract tx-sender)))
+            
+            (map-set policies policy-id {
+                farmer: farmer,
+                premium: final-premium,
+                coverage: new-coverage,
+                crop-type: (get crop-type old-policy),
+                location: (get location old-policy),
+                start-block: current-block,
+                end-block: end-block,
+                temperature-threshold-min: (get temperature-threshold-min old-policy),
+                temperature-threshold-max: (get temperature-threshold-max old-policy),
+                rainfall-threshold-min: (get rainfall-threshold-min old-policy),
+                rainfall-threshold-max: (get rainfall-threshold-max old-policy),
+                is-active: true,
+                is-claimed: false
+            })
+            
+            (map-set policies old-policy-id (merge old-policy { is-active: false }))
+            (map-set farmer-renewal-count farmer (+ renewal-count u1))
+            (var-set policy-counter policy-id)
+            (var-set total-premiums (+ (var-get total-premiums) final-premium))
+            
+            (let ((current-policies (default-to (list) (map-get? farmer-policies farmer))))
+                (map-set farmer-policies farmer (unwrap! (as-max-len? (append current-policies policy-id) u50) ERR_INVALID_POLICY))
+            )
+            
+            (ok { new-policy-id: policy-id, discount-applied: discount, final-premium: final-premium })
+        )
+    )
+)
+
+(define-read-only (get-farmer-renewal-count (farmer principal))
+    (default-to u0 (map-get? farmer-renewal-count farmer))
+)
+
+(define-read-only (calculate-renewal-discount (farmer principal) (premium uint))
+    (let ((renewal-count (default-to u0 (map-get? farmer-renewal-count farmer))))
+        (if (>= renewal-count LOYALTY_DISCOUNT_THRESHOLD)
+            (/ (* premium LOYALTY_DISCOUNT_PERCENT) u100)
+            u0
+        )
+    )
+)
+
+(define-read-only (is-eligible-for-renewal (policy-id uint))
+    (match (map-get? policies policy-id)
+        policy-data
+        (and 
+            (> stacks-block-height (get end-block policy-data))
+            (not (get is-claimed policy-data))
+        )
+        false
+    )
 )
