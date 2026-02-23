@@ -10,6 +10,7 @@
 (define-constant ERR_POLICY_NOT_FOUND (err u108))
 (define-constant ERR_POLICY_NOT_EXPIRED (err u109))
 (define-constant ERR_INVALID_RENEWAL (err u110))
+(define-constant ERR_CANNOT_TRANSFER (err u111))
 
 (define-constant LOYALTY_DISCOUNT_THRESHOLD u3)
 (define-constant LOYALTY_DISCOUNT_PERCENT u10)
@@ -472,4 +473,36 @@
         )
         false
     )
+)
+
+(define-map policy-transfer-log uint { from: principal, to: principal, transferred-at: uint })
+
+(define-public (transfer-policy (policy-id uint) (new-owner principal))
+    (let ((policy-data (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get farmer policy-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active policy-data) ERR_POLICY_NOT_ACTIVE)
+        (asserts! (not (get is-claimed policy-data)) ERR_ALREADY_CLAIMED)
+        (asserts! (not (is-eq tx-sender new-owner)) ERR_CANNOT_TRANSFER)
+        (asserts! (<= stacks-block-height (get end-block policy-data)) ERR_POLICY_EXPIRED)
+
+        (map-set policies policy-id
+            (merge policy-data { farmer: new-owner }))
+
+        (map-set policy-transfer-log policy-id {
+            from: tx-sender,
+            to: new-owner,
+            transferred-at: stacks-block-height
+        })
+
+        (let ((new-owner-policies (default-to (list) (map-get? farmer-policies new-owner))))
+            (map-set farmer-policies new-owner
+                (unwrap! (as-max-len? (append new-owner-policies policy-id) u50) ERR_INVALID_POLICY))
+        )
+
+        (ok true)
+    )
+)
+
+(define-read-only (get-policy-transfer (policy-id uint))
+    (map-get? policy-transfer-log policy-id)
 )
